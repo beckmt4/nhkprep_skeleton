@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+env/
+venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# VS Code
+.vscode/.ropeproject/
+.vscode/ipch/
