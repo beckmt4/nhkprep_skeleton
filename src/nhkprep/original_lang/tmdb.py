@@ -34,18 +34,22 @@ class TMDbBackend(BaseOriginalLanguageBackend):
     RATE_LIMIT_REQUESTS = 40
     RATE_LIMIT_WINDOW = 10.0  # seconds
     
-    def __init__(self, api_key: str | None = None, timeout: float = 10.0):
+    def __init__(self, api_key: str | None = None, timeout: float = 10.0,
+                 request_timeout: float | None = None, **kwargs):
         """
         Initialize TMDb backend.
         
         Args:
             api_key: TMDb API key. If None, will try to get from config/environment
-            timeout: HTTP request timeout in seconds
+            timeout: HTTP request timeout in seconds (legacy parameter)
+            request_timeout: HTTP request timeout in seconds (new parameter from config)
+            **kwargs: Additional config parameters (ignored for compatibility)
         """
         super().__init__("tmdb")
         
         self.api_key = api_key or self._get_api_key()
-        self.timeout = timeout
+        # Use request_timeout if provided, otherwise fall back to timeout
+        self.timeout = request_timeout if request_timeout is not None else timeout
         
         # Rate limiting state
         self._request_times: list[float] = []

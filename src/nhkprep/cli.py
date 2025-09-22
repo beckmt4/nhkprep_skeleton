@@ -1,8 +1,10 @@
 from __future__ import annotations
+import asyncio
 import json
 from pathlib import Path
 import typer
 from rich import print
+from rich.table import Table
 from .version import __version__
 from .logging_setup import configure_logging
 from .media_probe import ffprobe
@@ -10,6 +12,8 @@ from .config import RuntimeConfig
 from .media_edit import remux_keep_ja_en_set_ja_default, detect_and_fix_language_tags
 from .enhanced_language_detect import EnhancedLanguageDetector, apply_language_tags as enhanced_apply_language_tags
 from .performance_language_detect import PerformanceOptimizedDetector
+from .original_lang import OriginalLanguageDetector
+from .original_lang.config import OriginalLanguageConfig
 
 app = typer.Typer(add_completion=False, help="NHK -> English media prep pipeline")
 configure_logging()
@@ -544,6 +548,421 @@ def detect_lang_performance(
     except Exception as e:
         print(f"[red]Performance detection failed:[/red] {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def detect_original_lang(
+    media_file: Path = typer.Argument(..., exists=True, readable=True, help="Media file to analyze"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+    title: str = typer.Option(None, "--title", help="Override title from filename"),
+    year: int = typer.Option(None, "--year", help="Override year from filename"),
+    imdb_id: str = typer.Option(None, "--imdb-id", help="Override IMDb ID from filename"),
+    tmdb_api_key: str = typer.Option(None, "--tmdb-key", help="TMDb API key (overrides config)"),
+    backends: str = typer.Option("tmdb,imdb", "--backends", help="Comma-separated list of backends (tmdb,imdb)"),
+    confidence_threshold: float = typer.Option(0.7, "--confidence", help="Minimum confidence threshold (0.0-1.0)"),
+    timeout_seconds: int = typer.Option(10, "--timeout", help="Timeout per backend in seconds"),
+    cache_enabled: bool = typer.Option(True, "--cache/--no-cache", help="Enable/disable result caching"),
+    cache_ttl: int = typer.Option(3600, "--cache-ttl", help="Cache TTL in seconds"),
+    show_cache_stats: bool = typer.Option(False, "--cache-stats", help="Show cache statistics"),
+):
+    """Detect the original language of a media file using TMDb and IMDb APIs.
+    
+    This command analyzes media files to determine their original production language
+    by parsing the filename and querying external databases. It supports caching
+    to avoid repeated API calls and provides detailed confidence metrics.
+    """
+    
+    async def detect():
+        # Create configuration
+        config = OriginalLanguageConfig(
+            tmdb_api_key=tmdb_api_key,
+            confidence_threshold=confidence_threshold,
+            request_timeout=timeout_seconds,
+            cache_enabled=cache_enabled,
+            cache_ttl=cache_ttl,
+        )
+        
+        # Override backend priorities if specified
+        if backends:
+            backend_list = [b.strip().lower() for b in backends.split(",")]
+            config.backend_priorities = backend_list
+        
+        # Create detector
+        detector = OriginalLanguageDetector(config)
+        
+        try:
+            # Create a MediaSearchQuery for manual overrides
+            if title or year or imdb_id:
+                from .original_lang import MediaSearchQuery
+                query = MediaSearchQuery(
+                    title=title,
+                    year=year,
+                    imdb_id=imdb_id,
+                    media_type="movie"  # Default to movie
+                )
+                result = await detector.detect_from_query(query, min_confidence=confidence_threshold)
+            else:
+                # Detect from filename
+                result = await detector.detect_from_filename(
+                    media_file.name,
+                    min_confidence=confidence_threshold
+                )
+            
+            if json_out:
+                # JSON output
+                output_data = {
+                    "file": str(media_file),
+                    "detection": {
+                        "original_language": result.original_language,
+                        "confidence": result.confidence,
+                        "source": result.source,
+                        "method": result.method,
+                        "details": result.details,
+                        "title": result.title,
+                        "year": result.year,
+                        "imdb_id": result.imdb_id,
+                        "tmdb_id": result.tmdb_id,
+                        "spoken_languages": result.spoken_languages,
+                        "production_countries": result.production_countries,
+                        "detection_time_ms": result.detection_time_ms,
+                        "timestamp": result.timestamp.isoformat()
+                    } if result else None,
+                }
+                
+                if show_cache_stats:
+                    output_data["cache_stats"] = await detector.get_cache_stats()
+                    
+                print(json.dumps(output_data, ensure_ascii=False, indent=2))
+            else:
+                # Human-readable output
+                print(f"[bold]Original Language Detection Results[/bold]")
+                print(f"File: {media_file.name}")
+                print()
+                
+                if result:
+                    # Create results table
+                    table = Table(show_header=True, header_style="bold cyan")
+                    table.add_column("Property")
+                    table.add_column("Value")
+                    
+                    table.add_row("Original Language", f"[green]{result.original_language}[/green]" if result.original_language else "[red]Not detected[/red]")
+                    table.add_row("Confidence", f"{result.confidence:.3f}")
+                    table.add_row("Source", result.source)
+                    table.add_row("Method", result.method)
+                    table.add_row("Title", result.title or "Unknown")
+                    if result.year:
+                        table.add_row("Year", str(result.year))
+                    if result.imdb_id:
+                        table.add_row("IMDb ID", result.imdb_id)
+                    if result.tmdb_id:
+                        table.add_row("TMDb ID", str(result.tmdb_id))
+                    table.add_row("Details", result.details or "N/A")
+                    table.add_row("Detection Time", f"{result.detection_time_ms:.0f}ms")
+                    
+                    print(table)
+                    print()
+                    
+                    # Language confidence interpretation
+                    if result.confidence >= 0.9:
+                        confidence_msg = "[green]Very High[/green] - Excellent match from reliable source"
+                    elif result.confidence >= 0.8:
+                        confidence_msg = "[green]High[/green] - Strong match, likely accurate"
+                    elif result.confidence >= 0.7:
+                        confidence_msg = "[yellow]Good[/yellow] - Reasonable match, probably accurate"
+                    elif result.confidence >= 0.5:
+                        confidence_msg = "[yellow]Moderate[/yellow] - Uncertain match, verify manually"
+                    else:
+                        confidence_msg = "[red]Low[/red] - Weak match, likely inaccurate"
+                        
+                    print(f"[bold]Confidence Level:[/bold] {confidence_msg}")
+                    
+                    # Note: alternative_results field doesn't exist in this version
+                    # Could show spoken_languages instead if available
+                    if result.spoken_languages:
+                        print()
+                        print("[bold]Spoken Languages:[/bold]")
+                        for i, lang in enumerate(result.spoken_languages[:3], 1):
+                            print(f"  {i}. {lang}")
+                else:
+                    print("[red]❌ No original language detected[/red]")
+                    print("This could mean:")
+                    print("• The filename couldn't be parsed to extract title/year information")
+                    print("• No matching results found in TMDb or IMDb databases")
+                    print("• All matches had confidence below the threshold")
+                    print("• Network or API errors occurred")
+                    
+                # Show cache stats if requested
+                if show_cache_stats:
+                    print()
+                    stats = await detector.get_cache_stats()
+                    print("[bold]Cache Statistics:[/bold]")
+                    print(f"  Total entries: {stats['total_entries']}")
+                    print(f"  Active entries: {stats['active_entries']}")
+                    print(f"  Cache directory: {stats['cache_dir']}")
+                    if stats['disk_usage_mb'] > 0:
+                        print(f"  Disk usage: {stats['disk_usage_mb']:.2f} MB")
+                        
+        except Exception as e:
+            error_msg = f"Original language detection failed: {e}"
+            if json_out:
+                print(json.dumps({"error": error_msg}, ensure_ascii=False, indent=2))
+            else:
+                print(f"[red]{error_msg}[/red]")
+            raise typer.Exit(1)
+    
+    # Run the async function
+    try:
+        asyncio.run(detect())
+    except KeyboardInterrupt:
+        print("\n[yellow]Detection cancelled by user[/yellow]")
+        raise typer.Exit(130)
+
+
+@app.command()
+def batch_detect_original_lang(
+    directory: Path = typer.Argument(..., exists=True, dir_okay=True, help="Directory containing media files"),
+    pattern: str = typer.Option("*.{mkv,mp4,avi,mov,m4v}", "--pattern", help="File pattern to match"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+    tmdb_api_key: str = typer.Option(None, "--tmdb-key", help="TMDb API key (overrides config)"),
+    backends: str = typer.Option("tmdb,imdb", "--backends", help="Comma-separated list of backends"),
+    confidence_threshold: float = typer.Option(0.7, "--confidence", help="Minimum confidence threshold"),
+    timeout_seconds: int = typer.Option(10, "--timeout", help="Timeout per backend in seconds"),
+    cache_enabled: bool = typer.Option(True, "--cache/--no-cache", help="Enable/disable caching"),
+    max_files: int = typer.Option(100, "--max-files", help="Maximum files to process"),
+    show_progress: bool = typer.Option(True, "--progress/--no-progress", help="Show progress information"),
+    output_file: Path = typer.Option(None, "--output", help="Save results to file"),
+):
+    """Batch detect original languages for multiple media files.
+    
+    Processes all media files in a directory and detects their original languages.
+    Results can be saved to a file for further processing.
+    """
+    
+    async def batch_detect():
+        from glob import glob
+        
+        # Create configuration
+        config = OriginalLanguageConfig(
+            tmdb_api_key=tmdb_api_key,
+            confidence_threshold=confidence_threshold,
+            request_timeout=timeout_seconds,
+            cache_enabled=cache_enabled,
+        )
+        
+        # Override backend priorities if specified
+        if backends:
+            backend_list = [b.strip().lower() for b in backends.split(",")]
+            config.backend_priorities = backend_list
+        
+        # Create detector
+        detector = OriginalLanguageDetector(config)
+        
+        # Find files
+        search_pattern = str(directory / pattern)
+        files = []
+        for ext in ['mkv', 'mp4', 'avi', 'mov', 'm4v']:
+            files.extend(glob(str(directory / f"*.{ext}")))
+            files.extend(glob(str(directory / f"*.{ext.upper()}")))
+        
+        files = [Path(f) for f in files][:max_files]
+        
+        if not files:
+            print(f"[red]No media files found in {directory} matching pattern {pattern}[/red]")
+            raise typer.Exit(1)
+        
+        print(f"[bold]Batch Original Language Detection[/bold]")
+        print(f"Directory: {directory}")
+        print(f"Files found: {len(files)}")
+        print(f"Backends: {', '.join(config.backend_priorities)}")
+        print()
+        
+        results = []
+        successful = 0
+        failed = 0
+        
+        for i, file_path in enumerate(files, 1):
+            if show_progress and not json_out:
+                print(f"[cyan]Processing {i}/{len(files)}:[/cyan] {file_path.name}")
+                
+            try:
+                result = await detector.detect_from_filename(file_path.name)
+                
+                file_result = {
+                    "file": str(file_path),
+                    "filename": file_path.name,
+                    "detection": {
+                        "original_language": result.original_language,
+                        "confidence": result.confidence,
+                        "source": result.source,
+                        "method": result.method,
+                        "details": result.details,
+                        "title": result.title,
+                        "year": result.year,
+                        "imdb_id": result.imdb_id,
+                        "tmdb_id": result.tmdb_id,
+                        "detection_time_ms": result.detection_time_ms,
+                    } if result else None,
+                    "success": result is not None and result.original_language is not None
+                }
+                results.append(file_result)
+                
+                if result and result.original_language:
+                    successful += 1
+                    if show_progress and not json_out:
+                        print(f"  ✅ {result.original_language} (confidence: {result.confidence:.3f})")
+                else:
+                    failed += 1
+                    if show_progress and not json_out:
+                        print(f"  ❌ No language detected")
+                        
+            except Exception as e:
+                failed += 1
+                file_result = {
+                    "file": str(file_path),
+                    "filename": file_path.name,
+                    "detection": None,
+                    "success": False,
+                    "error": str(e)
+                }
+                results.append(file_result)
+                
+                if show_progress and not json_out:
+                    print(f"  ❌ Error: {e}")
+        
+        # Final statistics
+        cache_stats = await detector.get_cache_stats()
+        
+        final_results = {
+            "summary": {
+                "total_files": len(files),
+                "successful_detections": successful,
+                "failed_detections": failed,
+                "success_rate": (successful / len(files) * 100) if files else 0
+            },
+            "cache_stats": cache_stats,
+            "files": results
+        }
+        
+        # Output results
+        if json_out:
+            print(json.dumps(final_results, ensure_ascii=False, indent=2))
+        else:
+            print()
+            print("[bold]Batch Detection Complete[/bold]")
+            print(f"✅ Successful: {successful}/{len(files)} ({successful/len(files)*100:.1f}%)")
+            print(f"❌ Failed: {failed}/{len(files)} ({failed/len(files)*100:.1f}%)")
+            
+            if cache_stats.get('total_entries', 0) > 0:
+                print(f"💾 Cache entries: {cache_stats['total_entries']}")
+            
+            # Show language distribution
+            lang_counts = {}
+            for result in results:
+                if result['success'] and result['detection']:
+                    lang = result['detection']['original_language']
+                    lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            
+            if lang_counts:
+                print()
+                print("[bold]Language Distribution:[/bold]")
+                for lang, count in sorted(lang_counts.items(), key=lambda x: x[1], reverse=True):
+                    print(f"  {lang}: {count} files")
+        
+        # Save to file if requested
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(final_results, f, ensure_ascii=False, indent=2)
+            
+            if not json_out:
+                print(f"\n💾 Results saved to: {output_file}")
+    
+    # Run the async function
+    try:
+        asyncio.run(batch_detect())
+    except KeyboardInterrupt:
+        print("\n[yellow]Batch detection cancelled by user[/yellow]")
+        raise typer.Exit(130)
+
+
+@app.command()
+def manage_original_lang_cache(
+    action: str = typer.Argument(..., help="Action: stats, cleanup, clear"),
+    cache_dir: Path = typer.Option(None, "--cache-dir", help="Cache directory (uses default if not specified)"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+):
+    """Manage the original language detection cache.
+    
+    Available actions:
+    • stats - Show cache statistics and usage
+    • cleanup - Remove expired cache entries
+    • clear - Remove all cache entries
+    """
+    
+    async def manage_cache():
+        # Create configuration and detector
+        config = OriginalLanguageConfig(cache_dir=cache_dir)
+        detector = OriginalLanguageDetector(config)
+        
+        try:
+            if action == "stats":
+                stats = await detector.get_cache_stats()
+                
+                if json_out:
+                    print(json.dumps(stats, ensure_ascii=False, indent=2))
+                else:
+                    print("[bold]Original Language Detection Cache Statistics[/bold]")
+                    print()
+                    print(f"Cache Directory: {stats['cache_dir']}")
+                    print(f"Total Entries: {stats['total_entries']}")
+                    print(f"Active Entries: {stats['active_entries']}")
+                    print(f"Expired Entries: {stats['total_entries'] - stats['active_entries']}")
+                    print(f"Disk Usage: {stats['disk_usage_mb']:.2f} MB")
+                    
+                    if stats['oldest_entry']:
+                        print(f"Oldest Entry: {stats['oldest_entry']}")
+                    if stats['newest_entry']:
+                        print(f"Newest Entry: {stats['newest_entry']}")
+                        
+            elif action == "cleanup":
+                removed = await detector.cleanup_cache()
+                
+                if json_out:
+                    print(json.dumps({"removed_entries": removed}, ensure_ascii=False, indent=2))
+                else:
+                    print(f"[green]Cache cleanup complete[/green]")
+                    print(f"Removed {removed} expired entries")
+                    
+            elif action == "clear":
+                removed = await detector.clear_cache()
+                
+                if json_out:
+                    print(json.dumps({"removed_entries": removed}, ensure_ascii=False, indent=2))
+                else:
+                    print(f"[green]Cache cleared[/green]")
+                    print(f"Removed {removed} total entries")
+                    
+            else:
+                error_msg = f"Unknown action: {action}. Use 'stats', 'cleanup', or 'clear'"
+                if json_out:
+                    print(json.dumps({"error": error_msg}, ensure_ascii=False, indent=2))
+                else:
+                    print(f"[red]{error_msg}[/red]")
+                raise typer.Exit(1)
+                
+        except Exception as e:
+            error_msg = f"Cache management failed: {e}"
+            if json_out:
+                print(json.dumps({"error": error_msg}, ensure_ascii=False, indent=2))
+            else:
+                print(f"[red]{error_msg}[/red]")
+            raise typer.Exit(1)
+    
+    # Run the async function
+    try:
+        asyncio.run(manage_cache())
+    except KeyboardInterrupt:
+        print("\n[yellow]Cache management cancelled by user[/yellow]")
+        raise typer.Exit(130)
 
 
 if __name__ == "__main__":

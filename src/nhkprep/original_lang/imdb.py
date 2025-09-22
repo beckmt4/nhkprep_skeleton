@@ -83,17 +83,21 @@ class IMDbBackend(BaseOriginalLanguageBackend):
         'lithuanian': 'lt',
     }
     
-    def __init__(self, timeout: float = 15.0, max_retries: int = 3):
+    def __init__(self, timeout: float = 15.0, max_retries: int = 3, 
+                 request_timeout: float | None = None, **kwargs):
         """
         Initialize IMDb backend.
         
         Args:
-            timeout: HTTP request timeout in seconds
+            timeout: HTTP request timeout in seconds (legacy parameter)
             max_retries: Maximum number of retries for failed requests
+            request_timeout: HTTP request timeout in seconds (new parameter from config)
+            **kwargs: Additional config parameters (ignored for compatibility)
         """
         super().__init__("imdb")
         
-        self.timeout = timeout
+        # Use request_timeout if provided, otherwise fall back to timeout
+        self.timeout = request_timeout if request_timeout is not None else timeout
         self.max_retries = max_retries
         
         # Rate limiting state
