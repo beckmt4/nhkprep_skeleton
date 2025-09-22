@@ -156,10 +156,18 @@ class OriginalLanguageBackend(ABC):
 class OriginalLanguageDetector:
     """Main detector that orchestrates multiple backends."""
     
-    def __init__(self):
-        """Initialize with empty backend list."""
+    def __init__(self, config=None):
+        """Initialize with optional configuration."""
+        from .config import OriginalLanguageConfig
+        
+        self.config = config if config is not None else OriginalLanguageConfig()
         self.backends: list[OriginalLanguageBackend] = []
         self.logger = logging.getLogger(__name__)
+        
+        # Validate configuration
+        issues = self.config.validate()
+        if issues:
+            self.logger.warning(f"Configuration issues: {', '.join(issues)}")
     
     def add_backend(self, backend: OriginalLanguageBackend) -> None:
         """Add a backend to the detection pipeline."""
@@ -169,22 +177,51 @@ class OriginalLanguageDetector:
         else:
             self.logger.warning(f"Backend not available: {backend.name}")
     
+    def setup_default_backends(self) -> None:
+        """Set up backends based on configuration."""
+        if not self.config.enabled:
+            self.logger.info("Original language detection is disabled")
+            return
+        
+        available_backends = self.config.get_available_backends()
+        self.logger.debug(f"Setting up backends: {available_backends}")
+        
+        for backend_name in available_backends:
+            try:
+                if backend_name == "tmdb":
+                    from .tmdb import TMDbBackend
+                    backend_config = self.config.get_backend_config("tmdb")
+                    backend = TMDbBackend(**backend_config)
+                    self.add_backend(backend)
+                elif backend_name == "imdb":
+                    from .imdb import IMDbBackend
+                    backend_config = self.config.get_backend_config("imdb")
+                    backend = IMDbBackend(**backend_config)
+                    self.add_backend(backend)
+            except Exception as e:
+                self.logger.error(f"Failed to initialize {backend_name} backend: {e}")
+    
     async def detect_from_filename(
         self, 
         filename: str,
-        min_confidence: float = 0.5
+        min_confidence: float | None = None
     ) -> OriginalLanguageDetection | None:
         """
         Detect original language from a filename.
         
         Args:
             filename: Media filename to analyze
-            min_confidence: Minimum confidence threshold
+            min_confidence: Minimum confidence threshold (uses config default if None)
             
         Returns:
             Best detection result above threshold or None
         """
         from ..filename_parser import parse_filename
+        
+        if not self.config.enabled:
+            return None
+        
+        effective_min_confidence = min_confidence if min_confidence is not None else self.config.confidence_threshold
         
         start_time = time.time()
         
@@ -195,48 +232,77 @@ class OriginalLanguageDetector:
         self.logger.debug(f"Detecting original language for: {filename}")
         self.logger.debug(f"Parsed as: {parsed.title} ({parsed.year}) - {query.media_type}")
         
-        # Try each backend in order
-        best_result = None
-        for backend in self.backends:
-            try:
-                result = await backend.detect_original_language(query)
-                if result and result.confidence >= min_confidence:
-                    if not best_result or result.confidence > best_result.confidence:
-                        best_result = result
-                        # If we get a perfect match, stop searching
-                        if result.confidence >= 1.0:
-                            break
-            except Exception as e:
-                self.logger.error(f"Backend {backend.name} failed: {e}")
-        
-        # Add timing information
-        if best_result:
-            best_result.detection_time_ms = (time.time() - start_time) * 1000
-        
-        return best_result
+        return await self._detect_with_timeout(query, effective_min_confidence, start_time)
     
     async def detect_from_query(
         self,
         query: MediaSearchQuery,
-        min_confidence: float = 0.5
+        min_confidence: float | None = None
     ) -> OriginalLanguageDetection | None:
         """
         Detect original language from a search query.
         
         Args:
             query: Media search parameters
-            min_confidence: Minimum confidence threshold
+            min_confidence: Minimum confidence threshold (uses config default if None)
             
         Returns:
             Best detection result above threshold or None
         """
+        if not self.config.enabled:
+            return None
+        
+        effective_min_confidence = min_confidence if min_confidence is not None else self.config.confidence_threshold
+        
         start_time = time.time()
         
         self.logger.debug(f"Detecting from query: {query.title} ({query.year})")
         
-        # Try each backend in order
+        return await self._detect_with_timeout(query, effective_min_confidence, start_time)
+    
+    async def _detect_with_timeout(
+        self,
+        query: MediaSearchQuery,
+        min_confidence: float,
+        start_time: float
+    ) -> OriginalLanguageDetection | None:
+        """Internal method to handle detection with timeout."""
+        import asyncio
+        
+        try:
+            # Create detection task with timeout
+            detection_task = asyncio.create_task(
+                self._try_backends(query, min_confidence)
+            )
+            
+            result = await asyncio.wait_for(
+                detection_task, 
+                timeout=self.config.total_timeout
+            )
+            
+            # Add timing information
+            if result:
+                result.detection_time_ms = (time.time() - start_time) * 1000
+            
+            return result
+            
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Detection timed out after {self.config.total_timeout}s")
+            return None
+    
+    async def _try_backends(
+        self,
+        query: MediaSearchQuery,
+        min_confidence: float
+    ) -> OriginalLanguageDetection | None:
+        """Try backends in order until we get a good result."""
+        # Ensure we have backends set up
+        if not self.backends:
+            self.setup_default_backends()
+        
         best_result = None
-        for backend in self.backends:
+        
+        for backend in self.backends[:self.config.max_backends]:
             try:
                 result = await backend.detect_original_language(query)
                 if result and result.confidence >= min_confidence:
@@ -247,10 +313,6 @@ class OriginalLanguageDetector:
                             break
             except Exception as e:
                 self.logger.error(f"Backend {backend.name} failed: {e}")
-        
-        # Add timing information  
-        if best_result:
-            best_result.detection_time_ms = (time.time() - start_time) * 1000
         
         return best_result
     
