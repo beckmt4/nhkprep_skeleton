@@ -3,5 +3,8 @@
   "python.testing.pytestEnabled": true,
   "python.testing.pytestArgs": ["-q"],
   "python.analysis.typeCheckingMode": "basic",
-  "ruff.lint.args": ["--fix"]
+  "ruff.lint.args": [
+    "--fix"
+  ],
+  "python-envs.pythonProjects": []
 }
