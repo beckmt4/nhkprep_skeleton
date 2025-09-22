@@ -8,6 +8,7 @@ from .logging_setup import configure_logging
 from .media_probe import ffprobe
 from .config import RuntimeConfig
 from .media_edit import remux_keep_ja_en_set_ja_default, detect_and_fix_language_tags
+from .enhanced_language_detect import EnhancedLanguageDetector, apply_language_tags as enhanced_apply_language_tags
 
 app = typer.Typer(add_completion=False, help="NHK -> English media prep pipeline")
 configure_logging()
@@ -189,6 +190,187 @@ def detect_lang(
     except Exception as e:
         print(f"[red]Language detection failed:[/red] {e}")
         raise typer.Exit(1)
+
+
+@app.command()
+def detect_lang_enhanced(
+    video_path: Path = typer.Argument(..., exists=True, readable=True, help="Video file"),
+    execute: bool = typer.Option(False, "--execute", help="Actually apply language tags (otherwise just show detection)"),
+    force: bool = typer.Option(False, "--force", help="Force detection even for tracks that already have language tags"),
+    confidence: float = typer.Option(0.5, "--confidence", help="Minimum confidence threshold (0.0-1.0)"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+):
+    """Enhanced production-ready language detection with improved accuracy and performance metrics."""
+    mi = ffprobe(video_path)
+    
+    # Use the enhanced detector
+    detector = EnhancedLanguageDetector()
+    detector.confidence_threshold = confidence
+    
+    try:
+        print(f"[bold]Enhanced Language Detection for:[/bold] {video_path.name}")
+        print()
+        
+        # Detect languages for all tracks
+        detections = detector.detect_all_languages(mi, force_detection=force)
+        
+        # Prepare results for display/JSON
+        results = {
+            "file": str(video_path),
+            "detections": {},
+            "changes_planned": [],
+            "changes_applied": [],
+            "skipped": [],
+            "performance": {
+                "total_detection_time_ms": sum(d.detection_time_ms for d in detections.values()),
+                "average_detection_time_ms": sum(d.detection_time_ms for d in detections.values()) / len(detections) if detections else 0,
+            }
+        }
+        
+        # Process each detection
+        for track_idx, detection in detections.items():
+            stream = mi.streams[track_idx]
+            track_num = track_idx + 1
+            
+            # Store detection info
+            detection_info = {
+                "current_language": stream.language,
+                "detected_language": detection.language,
+                "confidence": detection.confidence,
+                "method": detection.method,
+                "details": detection.details,
+                "alternative_languages": detection.alternative_languages or [],
+                "text_sample_size": detection.text_sample_size,
+                "detection_time_ms": detection.detection_time_ms
+            }
+            results["detections"][track_idx] = detection_info
+            
+            # Determine if we should apply the change
+            should_apply = False
+            reason = ""
+            
+            if detection.language and detection.confidence >= confidence:
+                current_lang = stream.language
+                detected_lang = detection.language
+                
+                # Apply if no current language or different language detected
+                if not current_lang or current_lang.lower() in ('und', 'unknown', '', 'null'):
+                    should_apply = True
+                    reason = f"No valid current language"
+                elif force and current_lang.lower() != detected_lang.lower():
+                    should_apply = True
+                    reason = f"Forced update: {current_lang} → {detected_lang}"
+                elif current_lang.lower() != detected_lang.lower():
+                    if not force:
+                        results["skipped"].append({
+                            "track": track_num,
+                            "reason": f"Current language '{current_lang}' differs from detected '{detected_lang}' (use --force to override)"
+                        })
+            else:
+                if detection.language:
+                    results["skipped"].append({
+                        "track": track_num,
+                        "reason": f"Low confidence: {detection.confidence:.3f} < {confidence:.3f}"
+                    })
+                else:
+                    results["skipped"].append({
+                        "track": track_num,
+                        "reason": "No language detected"
+                    })
+            
+            if should_apply:
+                change = {
+                    "track": track_num,
+                    "language": detection.language,
+                    "confidence": detection.confidence,
+                    "method": detection.method,
+                    "reason": reason
+                }
+                results["changes_planned"].append(change)
+        
+        # Apply changes if requested
+        if execute and results["changes_planned"]:
+            # Prepare detection dictionary for apply function
+            apply_detections = {}
+            for change in results["changes_planned"]:
+                track_idx = change["track"] - 1
+                apply_detections[track_idx] = detections[track_idx]
+            
+            changes_applied = enhanced_apply_language_tags(
+                video_path, apply_detections, execute=True, confidence_threshold=confidence
+            )
+            results["changes_applied"] = changes_applied
+        
+        # Output results
+        if json_out:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            # Show detection results
+            print("[bold]Enhanced Detection Results:[/bold]")
+            for track_idx, detection_info in results["detections"].items():
+                track_num = track_idx + 1
+                stream = mi.streams[track_idx]
+                current = detection_info["current_language"] or "none"
+                detected = detection_info["detected_language"] or "none"
+                confidence = detection_info["confidence"]
+                method = detection_info["method"]
+                
+                print(f"  Track {track_num} ({stream.codec_type}):")
+                print(f"    Current: {current}")
+                print(f"    Detected: {detected} (confidence: {confidence:.3f})")
+                print(f"    Method: {method}")
+                print(f"    Details: {detection_info['details']}")
+                
+                if detection_info["alternative_languages"]:
+                    alts = ", ".join([f"{lang}({conf:.3f})" for lang, conf in detection_info["alternative_languages"][:3]])
+                    print(f"    Alternatives: {alts}")
+                
+                if detection_info["text_sample_size"] > 0:
+                    print(f"    Text sample: {detection_info['text_sample_size']} characters")
+                
+                print(f"    Detection time: {detection_info['detection_time_ms']:.1f}ms")
+                print()
+            
+            # Show planned/applied changes
+            if results["changes_planned"]:
+                print(f"[yellow]{'Applied Changes' if execute else 'Planned Changes'}:[/yellow]")
+                
+                if execute:
+                    for change in results["changes_applied"]:
+                        print(f"  ✓ {change}")
+                else:
+                    for change in results["changes_planned"]:
+                        print(f"  • Track {change['track']}: → {change['language']} "
+                              f"(confidence: {change['confidence']:.3f}, method: {change['method']})")
+                print()
+            
+            # Show skipped tracks
+            if results["skipped"]:
+                print("[dim]Skipped Tracks:[/dim]")
+                for skip in results["skipped"]:
+                    print(f"  Track {skip['track']}: {skip['reason']}")
+                print()
+            
+            # Show performance metrics
+            print("[bold]Performance Metrics:[/bold]")
+            print(f"  Total detection time: {results['performance']['total_detection_time_ms']:.1f}ms")
+            print(f"  Average per track: {results['performance']['average_detection_time_ms']:.1f}ms")
+            print()
+            
+            # Show summary
+            total_tracks = len([s for s in mi.streams if s.codec_type in ('audio', 'subtitle')])
+            detected_count = len([d for d in results["detections"].values() if d["detected_language"]])
+            applied_count = len(results["changes_applied"] if execute else results["changes_planned"])
+            
+            print(f"[bold]Summary:[/bold] {detected_count}/{total_tracks} languages detected, {applied_count} changes {'applied' if execute else 'planned'}")
+            
+            if not execute and results["changes_planned"]:
+                print("[yellow]Use --execute to apply the planned changes[/yellow]")
+        
+    except Exception as e:
+        print(f"[red]Enhanced language detection failed:[/red] {e}")
+        raise typer.Exit(1)
+
 
 if __name__ == "__main__":
     app()
