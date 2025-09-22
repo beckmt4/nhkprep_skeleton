@@ -56,7 +56,7 @@ class EnhancedLanguageDetector:
         self.max_text_sample = 2000  # Maximum characters to analyze
         self.whisper_model = None  # Lazy-load Whisper model
         self.whisper_model_size = "base"  # Default model size (base is good balance of speed/accuracy)
-        self.whisper_sample_duration = 30  # Seconds of audio to analyze
+        self.whisper_sample_duration = 180  # Seconds of audio to analyze (3 minutes)
         self.google_translator = None  # Lazy-load Google Translator
         self.cloud_api_enabled = True  # Enable cloud API fallback
         
