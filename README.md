@@ -3,6 +3,7 @@
 A production-ready Python CLI to prepare Japanese TV/movies (NHK and similar) for English audiences.
 
 ## Features
+
 - **Media Analysis**: Probe media with `ffprobe` and inventory streams (audio/subs, JA/EN focus)
 - **Language Detection**: Automatically detect and fix missing/incorrect language tags using multiple methods:
   - Subtitle text content analysis

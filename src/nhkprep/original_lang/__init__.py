@@ -159,9 +159,11 @@ class OriginalLanguageDetector:
     def __init__(self, config=None):
         """Initialize with optional configuration."""
         from .config import OriginalLanguageConfig
+        from .cache import create_cache_from_config
         
         self.config = config if config is not None else OriginalLanguageConfig()
         self.backends: list[OriginalLanguageBackend] = []
+        self.cache = create_cache_from_config(self.config)
         self.logger = logging.getLogger(__name__)
         
         # Validate configuration
@@ -266,8 +268,15 @@ class OriginalLanguageDetector:
         min_confidence: float,
         start_time: float
     ) -> OriginalLanguageDetection | None:
-        """Internal method to handle detection with timeout."""
+        """Internal method to handle detection with timeout and caching."""
         import asyncio
+        
+        # Try cache first
+        cached_result = await self.cache.get(query)
+        if cached_result and cached_result.confidence >= min_confidence:
+            self.logger.debug(f"Using cached result for query: {query.title}")
+            cached_result.detection_time_ms = (time.time() - start_time) * 1000
+            return cached_result
         
         try:
             # Create detection task with timeout
@@ -283,6 +292,13 @@ class OriginalLanguageDetector:
             # Add timing information
             if result:
                 result.detection_time_ms = (time.time() - start_time) * 1000
+                
+                # Cache the result
+                try:
+                    await self.cache.set(query, result)
+                    self.logger.debug(f"Cached detection result for: {query.title}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to cache result: {e}")
             
             return result
             
@@ -319,6 +335,27 @@ class OriginalLanguageDetector:
     def get_available_backends(self) -> list[str]:
         """Get list of available backend names."""
         return [backend.name for backend in self.backends if backend.is_available()]
+    
+    async def clear_cache(self) -> int:
+        """Clear all cached detection results."""
+        count = await self.cache.clear()
+        self.logger.info(f"Cleared {count} cached entries")
+        return count
+    
+    async def cleanup_cache(self) -> int:
+        """Remove expired cache entries."""
+        count = await self.cache.cleanup()
+        if count > 0:
+            self.logger.info(f"Cleaned up {count} expired cache entries")
+        return count
+    
+    async def get_cache_stats(self) -> dict:
+        """Get cache statistics."""
+        return await self.cache.stats()
+    
+    async def delete_from_cache(self, query: MediaSearchQuery) -> bool:
+        """Delete a specific query from cache."""
+        return await self.cache.delete(query)
 
 
 # Convenience functions for common use cases
