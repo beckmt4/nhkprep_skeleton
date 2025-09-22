@@ -4,25 +4,25 @@
     {
       "label": "Create venv & install",
       "type": "shell",
-      "command": "python -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'",
+      "command": "python -m venv .venv; if (Test-Path .venv/Scripts/Activate.ps1) { . .venv/Scripts/Activate.ps1; pip install -e .[dev] } else { Write-Error 'Venv activation script not found' }",
       "problemMatcher": []
     },
     {
       "label": "Lint (ruff)",
       "type": "shell",
-      "command": ". .venv/bin/activate && ruff check .",
+      "command": ". .venv/Scripts/Activate.ps1; ruff check .",
       "group": "build"
     },
     {
       "label": "Type-check (mypy)",
       "type": "shell",
-      "command": ". .venv/bin/activate && mypy src/nhkprep",
+      "command": ". .venv/Scripts/Activate.ps1; mypy src/nhkprep",
       "group": "build"
     },
     {
       "label": "Tests (pytest)",
       "type": "shell",
-      "command": ". .venv/bin/activate && pytest -q",
+      "command": ". .venv/Scripts/Activate.ps1; pytest -q",
       "group": "test"
     }
   ]

@@ -116,6 +116,7 @@ class IMDbBackend(BaseOriginalLanguageBackend):
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
+                follow_redirects=True,  # Handle HTTP 308 redirects
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -408,25 +409,82 @@ class IMDbBackend(BaseOriginalLanguageBackend):
     async def _extract_language_info(self, soup: BeautifulSoup) -> str | None:
         """Extract original language from various page sections."""
         
-        # Method 1: Look for "Language" in technical specs
+        # Method 1: Look for modern IMDb format - compressed language strings
+        language = await self._extract_from_modern_format(soup)
+        if language:
+            return language
+        
+        # Method 2: Look for "Language" in technical specs
         language = await self._extract_from_tech_specs(soup)
         if language:
             return language
         
-        # Method 2: Look in details section
+        # Method 3: Look in details section
         language = await self._extract_from_details_section(soup)
         if language:
             return language
         
-        # Method 3: Look for language information in structured data
+        # Method 4: Look for language information in structured data
         language = await self._extract_from_structured_data(soup)
         if language:
             return language
         
-        # Method 4: Look in storyline section
+        # Method 5: Look in storyline section
         language = await self._extract_from_storyline(soup)
         if language:
             return language
+            
+        # Method 6: Content inference for Japanese content
+        language = await self._extract_by_content_inference(soup)
+        if language:
+            return language
+        
+        return None
+    
+    async def _extract_from_modern_format(self, soup: BeautifulSoup) -> str | None:
+        """Extract language from modern IMDb compressed format."""
+        # Look for list items with compressed language info like "languagesjapaneseenglish"
+        all_lis = soup.find_all('li')
+        for li in all_lis:
+            li_text = li.get_text(strip=True).lower().replace(' ', '')
+            
+            # Check for patterns like "languagesjapanese", "languagesjapaneseenglish"
+            if li_text.startswith('languages') and len(li_text) < 50:
+                # Extract the part after "languages"
+                lang_part = li_text[9:]  # Remove "languages"
+                
+                # Check for Japanese first (original language likely comes first)
+                if 'japanese' in lang_part:
+                    return 'japanese'
+                # Check for other common languages
+                for lang_name, code in self.LANGUAGE_MAPPINGS.items():
+                    if lang_name in lang_part:
+                        return lang_name
+        
+        return None
+    
+    async def _extract_by_content_inference(self, soup: BeautifulSoup) -> str | None:
+        """Infer language from content indicators (fallback method)."""
+        page_text = soup.get_text().lower()
+        
+        # Japanese content indicators
+        japanese_indicators = {
+            'japanese': 2,
+            'japan': 1, 
+            'anime': 3,
+            'animation': 1,
+            'manga': 3,
+            'studio': 1,
+        }
+        
+        japanese_score = 0
+        for indicator, weight in japanese_indicators.items():
+            count = page_text.count(indicator)
+            japanese_score += count * weight
+        
+        # If high Japanese score and mentions Japanese specifically
+        if japanese_score > 15 and 'japanese' in page_text:
+            return 'japanese'
         
         return None
     

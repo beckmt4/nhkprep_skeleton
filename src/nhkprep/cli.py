@@ -10,8 +10,6 @@ from .logging_setup import configure_logging
 from .media_probe import ffprobe
 from .config import RuntimeConfig
 from .media_edit import remux_keep_ja_en_set_ja_default, detect_and_fix_language_tags
-from .enhanced_language_detect import EnhancedLanguageDetector, apply_language_tags as enhanced_apply_language_tags
-from .performance_language_detect import PerformanceOptimizedDetector
 from .original_lang import OriginalLanguageDetector
 from .original_lang.config import OriginalLanguageConfig
 
@@ -208,6 +206,12 @@ def detect_lang_enhanced(
     """Enhanced production-ready language detection with improved accuracy and performance metrics."""
     mi = ffprobe(video_path)
     
+    # Lazy import to avoid importing optional deps when not needed
+    from .enhanced_language_detect import (
+        EnhancedLanguageDetector,
+        apply_language_tags as enhanced_apply_language_tags,
+    )
+
     # Use the enhanced detector
     detector = EnhancedLanguageDetector()
     detector.confidence_threshold = confidence
@@ -391,6 +395,9 @@ def benchmark_lang_detection(
     print(f"Iterations: {iterations}")
     print()
     
+    # Lazy import to avoid importing optional deps when not needed
+    from .performance_language_detect import PerformanceOptimizedDetector
+
     # Create performance-optimized detector
     detector = PerformanceOptimizedDetector(enable_parallel=True, max_workers=4)
     
@@ -440,6 +447,10 @@ def detect_lang_performance(
     """Production-ready language detection with performance optimization, caching, and parallel processing."""
     mi = ffprobe(video_path)
     
+    # Lazy import to avoid importing optional deps when not needed
+    from .performance_language_detect import PerformanceOptimizedDetector
+    from .enhanced_language_detect import apply_language_tags as enhanced_apply_language_tags
+
     # Create performance-optimized detector
     cache_dir = Path.cwd() / ".nhkprep_cache" if cache else None
     detector = PerformanceOptimizedDetector(
@@ -684,7 +695,8 @@ def detect_original_lang(
                         for i, lang in enumerate(result.spoken_languages[:3], 1):
                             print(f"  {i}. {lang}")
                 else:
-                    print("[red]❌ No original language detected[/red]")
+                    # Avoid emoji for Windows cp1252 consoles
+                    print("[red]No original language detected[/red]")
                     print("This could mean:")
                     print("• The filename couldn't be parsed to extract title/year information")
                     print("• No matching results found in TMDb or IMDb databases")
@@ -809,11 +821,11 @@ def batch_detect_original_lang(
                 if result and result.original_language:
                     successful += 1
                     if show_progress and not json_out:
-                        print(f"  ✅ {result.original_language} (confidence: {result.confidence:.3f})")
+                        print(f"  OK {result.original_language} (confidence: {result.confidence:.3f})")
                 else:
                     failed += 1
                     if show_progress and not json_out:
-                        print(f"  ❌ No language detected")
+                        print(f"  ERROR No language detected")
                         
             except Exception as e:
                 failed += 1
@@ -827,7 +839,7 @@ def batch_detect_original_lang(
                 results.append(file_result)
                 
                 if show_progress and not json_out:
-                    print(f"  ❌ Error: {e}")
+                    print(f"  ERROR: {e}")
         
         # Final statistics
         cache_stats = await detector.get_cache_stats()
@@ -849,11 +861,11 @@ def batch_detect_original_lang(
         else:
             print()
             print("[bold]Batch Detection Complete[/bold]")
-            print(f"✅ Successful: {successful}/{len(files)} ({successful/len(files)*100:.1f}%)")
-            print(f"❌ Failed: {failed}/{len(files)} ({failed/len(files)*100:.1f}%)")
+            print(f"Successful: {successful}/{len(files)} ({successful/len(files)*100:.1f}%)")
+            print(f"Failed: {failed}/{len(files)} ({failed/len(files)*100:.1f}%)")
             
             if cache_stats.get('total_entries', 0) > 0:
-                print(f"💾 Cache entries: {cache_stats['total_entries']}")
+                print(f"Cache entries: {cache_stats['total_entries']}")
             
             # Show language distribution
             lang_counts = {}
@@ -874,7 +886,7 @@ def batch_detect_original_lang(
                 json.dump(final_results, f, ensure_ascii=False, indent=2)
             
             if not json_out:
-                print(f"\n💾 Results saved to: {output_file}")
+                print(f"\nResults saved to: {output_file}")
     
     # Run the async function
     try:
@@ -918,10 +930,12 @@ def manage_original_lang_cache(
                     print(f"Expired Entries: {stats['total_entries'] - stats['active_entries']}")
                     print(f"Disk Usage: {stats['disk_usage_mb']:.2f} MB")
                     
-                    if stats['oldest_entry']:
-                        print(f"Oldest Entry: {stats['oldest_entry']}")
-                    if stats['newest_entry']:
-                        print(f"Newest Entry: {stats['newest_entry']}")
+                    oldest = stats.get('oldest_entry')
+                    if oldest:
+                        print(f"Oldest Entry: {oldest}")
+                    newest = stats.get('newest_entry')
+                    if newest:
+                        print(f"Newest Entry: {newest}")
                         
             elif action == "cleanup":
                 removed = await detector.cleanup_cache()
