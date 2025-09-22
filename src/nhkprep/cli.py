@@ -9,6 +9,7 @@ from .media_probe import ffprobe
 from .config import RuntimeConfig
 from .media_edit import remux_keep_ja_en_set_ja_default, detect_and_fix_language_tags
 from .enhanced_language_detect import EnhancedLanguageDetector, apply_language_tags as enhanced_apply_language_tags
+from .performance_language_detect import PerformanceOptimizedDetector
 
 app = typer.Typer(add_completion=False, help="NHK -> English media prep pipeline")
 configure_logging()
@@ -369,6 +370,179 @@ def detect_lang_enhanced(
         
     except Exception as e:
         print(f"[red]Enhanced language detection failed:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def benchmark_lang_detection(
+    video_path: Path = typer.Argument(..., exists=True, readable=True, help="Video file"),
+    iterations: int = typer.Option(3, "--iterations", help="Number of benchmark iterations"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+):
+    """Benchmark language detection performance with different configurations."""
+    mi = ffprobe(video_path)
+    
+    print(f"[bold]Benchmarking Language Detection Performance[/bold]")
+    print(f"File: {video_path.name}")
+    print(f"Iterations: {iterations}")
+    print()
+    
+    # Create performance-optimized detector
+    detector = PerformanceOptimizedDetector(enable_parallel=True, max_workers=4)
+    
+    try:
+        # Run benchmark
+        benchmark_results = detector.benchmark_detection_methods(mi, iterations=iterations)
+        
+        if json_out:
+            print(json.dumps(benchmark_results, ensure_ascii=False, indent=2))
+        else:
+            # Display results in a readable format
+            print("[bold]Benchmark Results:[/bold]")
+            print()
+            
+            for config_name, results in benchmark_results["benchmarks"].items():
+                config_display = config_name.replace("_", " ").title()
+                print(f"[cyan]{config_display}:[/cyan]")
+                print(f"  Average: {results['average_time_ms']}ms")
+                print(f"  Range: {results['min_time_ms']}ms - {results['max_time_ms']}ms")
+                print()
+            
+            # Find best configuration
+            best_config = min(
+                benchmark_results["benchmarks"].items(),
+                key=lambda x: x[1]["average_time_ms"]
+            )
+            print(f"[green]Best Configuration:[/green] {best_config[0].replace('_', ' ').title()}")
+            print(f"[green]Best Time:[/green] {best_config[1]['average_time_ms']}ms average")
+        
+    except Exception as e:
+        print(f"[red]Benchmark failed:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def detect_lang_performance(
+    video_path: Path = typer.Argument(..., exists=True, readable=True, help="Video file"),
+    execute: bool = typer.Option(False, "--execute", help="Actually apply language tags (otherwise just show detection)"),
+    force: bool = typer.Option(False, "--force", help="Force detection even for tracks that already have language tags"),
+    confidence: float = typer.Option(0.5, "--confidence", help="Minimum confidence threshold (0.0-1.0)"),
+    parallel: bool = typer.Option(True, "--parallel/--no-parallel", help="Enable parallel processing"),
+    cache: bool = typer.Option(True, "--cache/--no-cache", help="Enable result caching"),
+    workers: int = typer.Option(4, "--workers", help="Number of parallel workers"),
+    json_out: bool = typer.Option(False, "--json", help="Output results as JSON"),
+    performance_report: bool = typer.Option(False, "--performance", help="Show detailed performance metrics"),
+):
+    """Production-ready language detection with performance optimization, caching, and parallel processing."""
+    mi = ffprobe(video_path)
+    
+    # Create performance-optimized detector
+    cache_dir = Path.cwd() / ".nhkprep_cache" if cache else None
+    detector = PerformanceOptimizedDetector(
+        cache_dir=cache_dir,
+        enable_parallel=parallel, 
+        max_workers=workers
+    )
+    detector.confidence_threshold = confidence
+    
+    try:
+        print(f"[bold]Performance-Optimized Language Detection[/bold]")
+        print(f"File: {video_path.name}")
+        print(f"Parallel: {parallel} ({'with' if cache else 'without'} caching)")
+        print()
+        
+        # Run optimized detection
+        detections = detector.detect_all_languages_optimized(mi, force_detection=force)
+        
+        # Apply changes if requested
+        changes_applied = []
+        if execute:
+            changes_applied = enhanced_apply_language_tags(
+                video_path, detections, execute=True, confidence_threshold=confidence
+            )
+        
+        if json_out:
+            # Prepare JSON output
+            json_results = {
+                "file": str(video_path),
+                "detections": {
+                    str(idx): {
+                        "language": det.language,
+                        "confidence": det.confidence,
+                        "method": det.method,
+                        "details": det.details,
+                        "alternatives": det.alternative_languages or [],
+                        "text_sample_size": det.text_sample_size,
+                        "detection_time_ms": det.detection_time_ms
+                    }
+                    for idx, det in detections.items()
+                },
+                "changes_applied": changes_applied,
+                "performance": detector.get_performance_report() if performance_report else None
+            }
+            print(json.dumps(json_results, ensure_ascii=False, indent=2))
+        else:
+            # Display results
+            print("[bold]Detection Results:[/bold]")
+            for stream_index, detection in detections.items():
+                stream = mi.streams[stream_index]
+                track_num = stream_index + 1
+                
+                print(f"  Track {track_num} ({stream.codec_type}):")
+                print(f"    Current: {stream.language or 'none'}")
+                print(f"    Detected: {detection.language or 'none'} (confidence: {detection.confidence:.3f})")
+                print(f"    Method: {detection.method}")
+                print(f"    Details: {detection.details}")
+                if detection.text_sample_size > 0:
+                    print(f"    Text sample: {detection.text_sample_size} characters")
+                print(f"    Detection time: {detection.detection_time_ms:.1f}ms")
+                if detection.alternative_languages:
+                    alts = ', '.join([f"{lang}({conf:.3f})" for lang, conf in detection.alternative_languages])
+                    print(f"    Alternatives: {alts}")
+                print()
+            
+            # Show applied changes
+            if execute and changes_applied:
+                print("[green]Applied Changes:[/green]")
+                for change in changes_applied:
+                    print(f"  ✓ {change}")
+                print()
+            
+            # Show performance metrics
+            if performance_report:
+                perf_report = detector.get_performance_report()
+                print("[bold]Performance Metrics:[/bold]")
+                
+                summary = perf_report["performance_summary"]
+                print(f"  Total time: {summary['total_time_ms']}ms")
+                print(f"  Average per track: {summary['average_time_per_detection_ms']}ms")
+                print(f"  Workers used: {summary['parallel_processing']['workers_used']}")
+                
+                cache_perf = perf_report["cache_performance"]
+                if cache_perf["enabled"]:
+                    print(f"  Cache hit rate: {cache_perf['hit_rate_percent']}%")
+                    print(f"  Cache hits/misses: {cache_perf['hits']}/{cache_perf['misses']}")
+                
+                methods = perf_report["detection_methods"]["method_usage"]
+                if methods:
+                    print(f"  Methods used: {', '.join([f'{m}({c})' for m, c in methods.items()])}")
+                print()
+            
+            # Summary
+            total_tracks = len([s for s in mi.streams if s.codec_type in ('audio', 'subtitle')])
+            detected_count = len([d for d in detections.values() if d.language])
+            applied_count = len(changes_applied) if execute else 0
+            
+            print(f"[bold]Summary:[/bold] {detected_count}/{total_tracks} languages detected")
+            if execute:
+                print(f"[bold]Applied:[/bold] {applied_count} changes")
+            else:
+                planned_changes = len([d for d in detections.values() 
+                                     if d.language and d.confidence >= confidence])
+                print(f"[bold]Planned:[/bold] {planned_changes} changes (use --execute to apply)")
+        
+    except Exception as e:
+        print(f"[red]Performance detection failed:[/red] {e}")
         raise typer.Exit(1)
 
 

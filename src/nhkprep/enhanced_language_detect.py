@@ -15,6 +15,23 @@ from .shell import run, run_json, which
 from .media_probe import MediaInfo, StreamInfo
 from .errors import ProbeError
 
+# Optional Whisper import - will gracefully degrade if not available
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    whisper = None
+
+# Optional Google Translate import - will gracefully degrade if not available
+try:
+    from googletrans import Translator, LANGUAGES
+    GOOGLETRANS_AVAILABLE = True
+except ImportError:
+    GOOGLETRANS_AVAILABLE = False
+    Translator = None
+    LANGUAGES = None
+
 # Ensure deterministic results
 DetectorFactory.seed = 0
 
@@ -25,7 +42,7 @@ class LanguageDetection:
     confidence: float  # 0.0 to 1.0
     method: str  # How the language was detected
     details: str  # Additional information about detection
-    alternative_languages: List[Tuple[str, float]] = None  # Alternative detections with confidence
+    alternative_languages: Optional[List[Tuple[str, float]]] = None  # Alternative detections with confidence
     text_sample_size: int = 0  # Size of analyzed text sample
     detection_time_ms: float = 0.0  # Time taken for detection
 
@@ -37,6 +54,11 @@ class EnhancedLanguageDetector:
         self.confidence_threshold = 0.5
         self.min_text_length = 50  # Minimum text length for reliable detection
         self.max_text_sample = 2000  # Maximum characters to analyze
+        self.whisper_model = None  # Lazy-load Whisper model
+        self.whisper_model_size = "base"  # Default model size (base is good balance of speed/accuracy)
+        self.whisper_sample_duration = 30  # Seconds of audio to analyze
+        self.google_translator = None  # Lazy-load Google Translator
+        self.cloud_api_enabled = True  # Enable cloud API fallback
         
         # Enhanced filename patterns with more comprehensive coverage
         self.filename_patterns = {
@@ -119,6 +141,15 @@ class EnhancedLanguageDetector:
             heuristic_detection.detection_time_ms = (time.time() - start_time) * 1000
             return heuristic_detection
         
+        # Method 5: Cloud API fallback (Google Translate) for difficult cases
+        if (GOOGLETRANS_AVAILABLE and self.cloud_api_enabled and 
+            text_sample and len(text_sample.strip()) >= self.min_text_length):
+            cloud_detection = self._detect_language_from_text_cloud(text_sample)
+            if cloud_detection and cloud_detection.confidence >= 0.3:
+                cloud_detection.text_sample_size = len(text_sample)
+                cloud_detection.detection_time_ms = (time.time() - start_time) * 1000
+                return cloud_detection
+        
         # No reliable detection found
         return LanguageDetection(
             language=None,
@@ -152,6 +183,13 @@ class EnhancedLanguageDetector:
         if filename_detection and filename_detection.confidence >= 0.6:
             filename_detection.detection_time_ms = (time.time() - start_time) * 1000
             return filename_detection
+        
+        # Method 2.5: Audio content analysis with Whisper (if available)
+        if WHISPER_AVAILABLE:
+            whisper_detection = self._detect_language_from_audio_whisper(media, stream)
+            if whisper_detection and whisper_detection.confidence >= 0.4:
+                whisper_detection.detection_time_ms = (time.time() - start_time) * 1000
+                return whisper_detection
         
         # Method 3: Enhanced content heuristics
         heuristic_detection = self._detect_from_content_heuristics(media.path, stream, 'audio')
@@ -493,6 +531,211 @@ class EnhancedLanguageDetector:
                     lines.append(clean_line)
         
         return lines
+    
+    def _detect_language_from_audio_whisper(self, media: MediaInfo, stream: StreamInfo) -> Optional[LanguageDetection]:
+        """Detect language from audio content using Whisper speech recognition."""
+        if not WHISPER_AVAILABLE:
+            return None
+        
+        try:
+            # Load Whisper model (lazy loading)
+            if self.whisper_model is None and whisper is not None:
+                self.whisper_model = whisper.load_model(self.whisper_model_size)
+            
+            # Extract audio sample for analysis
+            audio_sample_path = self._extract_audio_sample(media, stream)
+            if not audio_sample_path:
+                return None
+            
+            try:
+                if not self.whisper_model:
+                    return None
+                
+                # Run Whisper detection
+                result = self.whisper_model.transcribe(
+                    audio_sample_path, 
+                    word_timestamps=False,
+                    temperature=0,  # More deterministic results
+                    task="transcribe"  # We want detection, not translation
+                )
+                
+                detected_language = result.get("language", "")
+                if not detected_language or not isinstance(detected_language, str):
+                    return None
+                
+                # Calculate confidence based on Whisper's internal metrics
+                confidence = self._calculate_whisper_confidence(result)
+                
+                # Normalize language code
+                normalized_lang = self._normalize_language_code(detected_language)
+                
+                # Prepare details
+                text_length = len(result.get("text", ""))
+                details = f"Whisper detected {detected_language} from {self.whisper_sample_duration}s audio sample"
+                if text_length > 0:
+                    details += f" (transcribed {text_length} characters)"
+                
+                return LanguageDetection(
+                    language=normalized_lang,
+                    confidence=confidence,
+                    method="whisper_audio_analysis",
+                    details=details,
+                    alternative_languages=[],  # Whisper doesn't provide alternatives easily
+                    text_sample_size=text_length
+                )
+                
+            finally:
+                # Clean up temporary audio file
+                if audio_sample_path and Path(audio_sample_path).exists():
+                    Path(audio_sample_path).unlink()
+            
+        except Exception as e:
+            # Whisper analysis failed, return None to fall back to other methods
+            return None
+    
+    def _extract_audio_sample(self, media: MediaInfo, stream: StreamInfo) -> Optional[str]:
+        """Extract a sample of audio for Whisper analysis."""
+        try:
+            which("ffmpeg")
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            
+            try:
+                # Extract audio sample - Whisper prefers WAV format
+                run([
+                    "ffmpeg", "-i", str(media.path),
+                    "-map", f"0:{stream.index}",
+                    "-t", str(self.whisper_sample_duration),  # Sample duration
+                    "-ac", "1",  # Convert to mono for faster processing
+                    "-ar", "16000",  # 16kHz sample rate (Whisper standard)
+                    "-y", str(temp_path)
+                ])
+                
+                if temp_path.exists() and temp_path.stat().st_size > 0:
+                    return str(temp_path)
+                    
+            except Exception:
+                # Audio extraction failed
+                if temp_path.exists():
+                    temp_path.unlink()
+                return None
+                
+        except Exception:
+            return None
+        
+        return None
+    
+    def _calculate_whisper_confidence(self, whisper_result: dict) -> float:
+        """Calculate confidence score from Whisper results."""
+        # Whisper doesn't provide direct confidence scores, so we estimate based on:
+        # 1. Whether it detected speech
+        # 2. Length of transcribed text
+        # 3. Language detection consistency
+        
+        text = whisper_result.get("text", "")
+        language = whisper_result.get("language", "")
+        
+        if not language or not text.strip():
+            return 0.0
+        
+        # Base confidence starts at 0.5 for any detection
+        base_confidence = 0.5
+        
+        # Bonus for longer transcription (more data = more reliable)
+        text_length = len(text.strip())
+        if text_length > 100:
+            base_confidence += 0.2
+        elif text_length > 50:
+            base_confidence += 0.1
+        elif text_length < 10:
+            base_confidence -= 0.2
+        
+        # Bonus for common languages (Whisper is generally more accurate with these)
+        common_languages = {'en', 'ja', 'zh', 'es', 'fr', 'de', 'ko'}
+        if language in common_languages:
+            base_confidence += 0.1
+        
+        # Cap confidence at reasonable maximum for audio analysis
+        return min(0.85, max(0.1, base_confidence))
+    
+    def _detect_language_from_text_cloud(self, text: str) -> Optional[LanguageDetection]:
+        """Detect language from text using Google Translate API as fallback."""
+        if not GOOGLETRANS_AVAILABLE or not self.cloud_api_enabled:
+            return None
+        
+        try:
+            # Clean and preprocess text
+            cleaned_text = self._preprocess_text_for_detection(text)
+            if len(cleaned_text.strip()) < self.min_text_length:
+                return None
+            
+            # Initialize Google Translator (lazy loading)
+            if self.google_translator is None and Translator is not None:
+                self.google_translator = Translator()
+            
+            if not self.google_translator:
+                return None
+            
+            # Use Google Translate's language detection
+            detection_result = self.google_translator.detect(cleaned_text)
+            
+            if not detection_result or not hasattr(detection_result, 'lang'):
+                return None
+            
+            detected_lang = detection_result.lang
+            if not detected_lang:
+                return None
+            
+            # Get confidence (Google Translate provides this)
+            confidence = getattr(detection_result, 'confidence', 0.5)
+            
+            # Normalize language code
+            normalized_lang = self._normalize_language_code(detected_lang)
+            
+            # Calculate adjusted confidence based on text quality and Google's confidence
+            adjusted_confidence = self._calculate_cloud_confidence(
+                cleaned_text, confidence, detected_lang
+            )
+            
+            # Get language name for details
+            lang_name = LANGUAGES.get(detected_lang, detected_lang) if LANGUAGES else detected_lang
+            
+            return LanguageDetection(
+                language=normalized_lang,
+                confidence=adjusted_confidence,
+                method="cloud_api_translate",
+                details=f"Google Translate detected {lang_name} ({detected_lang}) with {confidence:.3f} confidence",
+                alternative_languages=[]  # Google Translate doesn't provide alternatives in this API
+            )
+            
+        except Exception as e:
+            # Cloud API failed, return None to indicate no detection
+            return None
+    
+    def _calculate_cloud_confidence(self, text: str, api_confidence: float, detected_lang: str) -> float:
+        """Calculate adjusted confidence score for cloud API results."""
+        # Start with API-provided confidence
+        base_confidence = api_confidence if api_confidence else 0.5
+        
+        # Adjust based on text length (more text = more reliable)
+        text_length = len(text.strip())
+        if text_length > 200:
+            base_confidence += 0.1
+        elif text_length < 50:
+            base_confidence -= 0.1
+        
+        # Adjust based on detected language reliability
+        # Google Translate is generally more reliable with major languages
+        major_languages = {'en', 'ja', 'zh', 'es', 'fr', 'de', 'ko', 'ar', 'hi', 'ru'}
+        if detected_lang in major_languages:
+            base_confidence += 0.05
+        
+        # For cloud API, we're more conservative about confidence
+        # since this is a fallback method
+        base_confidence *= 0.9
+        
+        return min(0.8, max(0.2, base_confidence))
     
     def detect_all_languages(self, media: MediaInfo, force_detection: bool = False) -> Dict[int, LanguageDetection]:
         """Detect languages for all audio and subtitle tracks with enhanced reporting."""
