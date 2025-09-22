@@ -1,13 +1,16 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from .shell import which, run
+from .shell import run_json
 from .paths import output_paths_for
 from .media_probe import MediaInfo
 from .errors import RemuxError
 
 def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: bool) -> Path:
-    which("ffmpeg")  # prefer mkvmerge, but ffmpeg fallback is fine for MVP
+    # Use mkvmerge for remuxing and mkvpropedit for flags
+    which("mkvmerge")
+    which("mkvpropedit")
     keep_plan = media.ja_en_only_plan()
     keep = keep_plan["keep_indices"]
     if not keep:
@@ -15,31 +18,56 @@ def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: b
     tmp_path, out_path = output_paths_for(media.path)
     if in_place:
         out_path = media.path.with_suffix(".inplace.tmp.mkv")
-    # Build map args; keep order as original
-    map_args: List[str] = []
-    for idx in keep:
-        map_args += ["-map", f"0:{idx}"]
-    # Set JA audio default (first JA audio we find)
-    disposition_args: List[str] = []
-    ja_default_set = False
-    for idx in keep:
-        # We don't have codec_type per index here, but okay for MVP; ffmpeg lacks language index easily.
-        # In a full impl, pass the language per index from MediaInfo.
-        pass
-    # MVP: just clear all defaults, then set first audio as default.
-    # (Full implementation would select first JA audio.)
-    # ffmpeg cannot easily set by language without complex filters; acceptable MVP simplification.
-    cmd = ["ffmpeg", "-y", "-i", str(media.path)] + map_args + ["-c", "copy"]
-    # Be explicit about output container to avoid relying on extension inference
-    cmd += ["-f", "matroska"]
-    # Clear defaults is not trivial with ffmpeg; rely on container edit later.
-    cmd += [str(tmp_path)]
+    # Build mkvmerge track selection; ensure only JA/EN audio/subs + all video are kept
+    keep_ids_csv = ",".join(str(i) for i in keep)
+    mkvmerge_cmd = [
+        "mkvmerge",
+        "-o", str(tmp_path),
+        "--no-attachments",  # drop attached cover images, etc.
+        "--tracks", f"0:{keep_ids_csv}",
+        str(media.path),
+    ]
     if execute:
-        run(cmd)
-        # Atomic move
+        # 1) Remux to temp with selected tracks only
+        run(mkvmerge_cmd)
+
+        # 2) Determine audio tracks in the temp file and select default = first JA audio if present else first audio
+        info = run_json(["mkvmerge", "-J", str(tmp_path)])
+        tracks = info.get("tracks", [])
+        audio_tracks = [t for t in tracks if t.get("type") == "audio"]
+
+        def norm_lang(val: Optional[str]) -> Optional[str]:
+            if not val:
+                return None
+            v = val.lower()
+            return {"ja": "ja", "jpn": "ja", "en": "en", "eng": "en"}.get(v, v)
+
+        # Pick preferred audio track ID
+        chosen_id: Optional[int] = None
+        for t in audio_tracks:
+            lang = norm_lang((t.get("properties") or {}).get("language"))
+            if lang == "ja":
+                chosen_id = t.get("id")
+                break
+        if chosen_id is None and audio_tracks:
+            chosen_id = audio_tracks[0].get("id")
+
+        # 3) Clear/set default flags on audio tracks using mkvpropedit
+        if chosen_id is not None:
+            for t in audio_tracks:
+                tid = t.get("id")
+                is_default = 1 if tid == chosen_id else 0
+                run([
+                    "mkvpropedit",
+                    str(tmp_path),
+                    "--edit", f"track:@{tid}",
+                    "--set", f"flag-default={is_default}",
+                ])
+
+        # 4) Atomic move to final destination (or in-place target)
         final_path = media.path if in_place else out_path
         Path(tmp_path).replace(final_path)
         return final_path
     else:
-        # Dry run: create no outputs; return planned path
+        # Dry run: return planned path only
         return out_path
