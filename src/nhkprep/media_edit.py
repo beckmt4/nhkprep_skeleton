@@ -114,7 +114,7 @@ def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: b
                 "--set", "flag-default=1",
             ])
 
-        # 3b) Set default subtitle: prefer EN if present, else first subtitle; do not clear others
+        # 3b) Set default subtitle: prefer EN if present, else first subtitle; clear others first
         subtitle_tracks = [t for t in tracks if t.get("type") in ("subtitles", "subtitle")]
         sub_chosen_id: Optional[int] = None
         for t in subtitle_tracks:
@@ -123,13 +123,22 @@ def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: b
                 break
         if sub_chosen_id is None and subtitle_tracks:
             sub_chosen_id = subtitle_tracks[0].get("id")
-        if sub_chosen_id is not None:
-            run([
-                "mkvpropedit",
-                str(tmp_path),
-                "--edit", f"track:@{sub_chosen_id}",
-                "--set", "flag-default=1",
-            ])
+        
+        # Clear all subtitle default flags first, then set the chosen one in a single command
+        if sub_chosen_id is not None and subtitle_tracks:
+            mkvpropedit_cmd = ["mkvpropedit", str(tmp_path)]
+            
+            # Clear all subtitle defaults first
+            for t in subtitle_tracks:
+                track_id = t.get("id")
+                if track_id is not None:
+                    mkvpropedit_cmd.extend(["--edit", f"track:@{track_id}", "--set", "flag-default=0"])
+            
+            # Set chosen track as default
+            mkvpropedit_cmd.extend(["--edit", f"track:@{sub_chosen_id}", "--set", "flag-default=1"])
+            
+            # Execute all changes in one command
+            run(mkvpropedit_cmd)
 
         # 4) Atomic move to final destination (or in-place target)
         final_path = media.path if in_place else out_path
