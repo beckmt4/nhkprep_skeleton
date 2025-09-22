@@ -6,6 +6,7 @@ from .shell import run_json
 from .paths import output_paths_for
 from .media_probe import MediaInfo
 from .errors import RemuxError
+from .language_detect import LanguageDetector, apply_language_tags
 
 def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: bool) -> Path:
     # Use mkvmerge for remuxing and mkvpropedit for flags
@@ -137,3 +138,106 @@ def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: b
     else:
         # Dry run: return planned path only
         return out_path
+
+
+def detect_and_fix_language_tags(media: MediaInfo, execute: bool = False, force_detection: bool = False, confidence_threshold: float = 0.5) -> dict:
+    """Detect and optionally fix language tags for audio and subtitle tracks.
+    
+    Args:
+        media: MediaInfo object for the file to process
+        execute: If True, actually apply the language tags. If False, just return detection results.
+        force_detection: If True, detect even for tracks that already have language tags
+        confidence_threshold: Minimum confidence level to apply detected languages
+    
+    Returns:
+        Dictionary with detection results and applied changes
+    """
+    detector = LanguageDetector()
+    detector.confidence_threshold = confidence_threshold
+    
+    # Get current language tags from the actual file
+    current_info = run_json(["mkvmerge", "-J", str(media.path)])
+    current_tracks = current_info.get("tracks", [])
+    
+    # Build mapping of stream index to current language
+    current_languages = {}
+    for track in current_tracks:
+        track_id = track.get("id")
+        props = track.get("properties", {})
+        current_lang = props.get("language")
+        if track_id is not None:
+            current_languages[track_id] = current_lang
+    
+    # Detect languages for all tracks
+    detections = detector.detect_all_languages(media)
+    
+    # Prepare results
+    results = {
+        "detections": {},
+        "changes_planned": [],
+        "changes_applied": [],
+        "skipped": []
+    }
+    
+    for stream_index, detection in detections.items():
+        # Get current language for this track
+        current_lang = current_languages.get(stream_index)
+        
+        # Store detection result
+        results["detections"][stream_index] = {
+            "current_language": current_lang,
+            "detected_language": detection.language,
+            "confidence": detection.confidence,
+            "method": detection.method,
+            "details": detection.details
+        }
+        
+        # Determine if we should apply this detection
+        should_apply = False
+        reason = ""
+        
+        if not detection.language:
+            reason = "No language detected"
+        elif detection.confidence < confidence_threshold:
+            reason = f"Confidence {detection.confidence:.2f} below threshold {confidence_threshold}"
+        elif current_lang and detector._is_valid_language_code(current_lang) and not force_detection:
+            reason = f"Track already has valid language tag: {current_lang}"
+        else:
+            should_apply = True
+            if current_lang:
+                reason = f"Replacing '{current_lang}' with '{detection.language}'"
+            else:
+                reason = f"Setting language to '{detection.language}'"
+        
+        if should_apply:
+            results["changes_planned"].append({
+                "track": stream_index + 1,  # mkvpropedit uses 1-based indexing
+                "language": detection.language,
+                "confidence": detection.confidence,
+                "method": detection.method,
+                "reason": reason
+            })
+        else:
+            results["skipped"].append({
+                "track": stream_index + 1,
+                "reason": reason,
+                "detection": detection.language,
+                "confidence": detection.confidence
+            })
+    
+    # Apply changes if requested
+    if execute and results["changes_planned"]:
+        try:
+            # Build detections dict in format expected by apply_language_tags
+            detections_to_apply = {}
+            for change in results["changes_planned"]:
+                track_index = change["track"] - 1  # Convert back to 0-based
+                detections_to_apply[track_index] = detections[track_index]
+            
+            applied_changes = apply_language_tags(media.path, detections_to_apply, execute=True, confidence_threshold=confidence_threshold)
+            results["changes_applied"] = applied_changes
+            
+        except Exception as e:
+            raise RemuxError(f"Failed to apply language tags: {e}")
+    
+    return results
