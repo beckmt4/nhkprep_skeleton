@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Optional, Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pathlib import Path
 from .shell import run_json, which
 from .errors import ProbeError
@@ -18,12 +18,12 @@ class StreamInfo(BaseModel):
     forced: bool = False
     default: bool = False
     title: Optional[str] = None
-    tags: dict = {}
+    tags: dict = Field(default_factory=dict)
 
 class MediaInfo(BaseModel):
     path: Path
     duration: Optional[float] = None
-    streams: List[StreamInfo] = []
+    streams: List[StreamInfo] = Field(default_factory=list)
 
     def ja_en_only_plan(self) -> dict:
         keep = []
@@ -71,9 +71,11 @@ def ffprobe(path: Path) -> MediaInfo:
             title=tags.get("title"),
             tags=tags
         ))
-    duration = None
-    try:
-        duration = float((data.get("format") or {}).get("duration"))
-    except Exception:
-        pass
+    duration: Optional[float] = None
+    dur_val = (data.get("format") or {}).get("duration")
+    if isinstance(dur_val, (int, float, str)):
+        try:
+            duration = float(dur_val)
+        except (TypeError, ValueError):
+            pass
     return MediaInfo(path=path, duration=duration, streams=streams)

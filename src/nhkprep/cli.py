@@ -26,7 +26,8 @@ def scan(
     """Probe a media file and print its stream inventory."""
     mi = ffprobe(video_path)
     if json_out:
-        print(json.dumps(mi.model_dump(), ensure_ascii=False, indent=2))
+        # Use JSON mode so Path and other types are serialized safely
+        print(json.dumps(mi.model_dump(mode="json"), ensure_ascii=False, indent=2))
     else:
         print(f"[bold]Path:[/bold] {mi.path}")
         print(f"[bold]Duration:[/bold] {mi.duration or '?'} s")
