@@ -30,6 +30,8 @@ def remux_keep_ja_en_set_ja_default(media: MediaInfo, execute: bool, in_place: b
     # (Full implementation would select first JA audio.)
     # ffmpeg cannot easily set by language without complex filters; acceptable MVP simplification.
     cmd = ["ffmpeg", "-y", "-i", str(media.path)] + map_args + ["-c", "copy"]
+    # Be explicit about output container to avoid relying on extension inference
+    cmd += ["-f", "matroska"]
     # Clear defaults is not trivial with ffmpeg; rely on container edit later.
     cmd += [str(tmp_path)]
     if execute:
