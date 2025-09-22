@@ -18,6 +18,7 @@ dependencies = [
   "anyio>=4.4.0",
   "sacrebleu>=2.4.3",
   "langdetect>=1.0.9",
+  "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
